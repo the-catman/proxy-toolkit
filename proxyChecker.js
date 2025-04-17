@@ -70,7 +70,7 @@ const checkProxy = (proxy) => {
     const storedProxies = fs.readFileSync("goodProxies.txt", "utf-8");
     goodProxies = goodProxies.join('\n');
 
-    const allProxies = utilities.processProxies(fetchedProxies + '\n' + storedProxies).trim();
+    const allProxies = utilities.processProxies(goodProxies + '\n' + storedProxies).trim();
 
-    fs.writeFileSync("goodProxies.txt", '\n' + allProxies);
+    fs.writeFileSync("goodProxies.txt", allProxies);
 })();

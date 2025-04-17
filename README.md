@@ -33,3 +33,7 @@ $ node proxyFetcher
 ## Pull requests
 
 Feel free to make a pull request.
+
+## Note
+
+Proxies do tend to go stale, so make sure you update (and clean up) the list every so often.
