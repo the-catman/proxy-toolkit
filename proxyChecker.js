@@ -1,76 +1,113 @@
 const fs = require("node:fs");
+const util = require("./util");
 const https = require("https");
-const utilities = require("./util");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 
-const proxies = fs.readFileSync("proxies.txt", "utf-8").split(/\r?\n/).filter((proxy) => {
-    try {
-        new URL(proxy);
-        return true;
-    } catch (err) {
-        console.log(`Proxy ${proxy} is corrupted.`);
-        return false;
-    }
-});
+const PROXIES_FILE = "proxies.txt";
+const GOOD_PROXIES_FILE = "goodProxies.txt";
+const TEST_URL = "https://httpbin.org/ip";
+const REQUEST_TIMEOUT = 10000;
 
-let goodProxies = [];
+function loadProxies(file) {
+    const raw = fs.readFileSync(file, "utf-8");
+    return raw.split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .filter(proxy => {
+            try {
+                new URL(proxy);
+                return true;
+            } catch (e) {
+                console.warn(`Skipping invalid proxy: ${proxy}`);
+                return false;
+            }
+        });
+}
 
-const checkProxy = (proxy) => {
-    const agent = proxy.startsWith("http") ? new HttpsProxyAgent(proxy) : new SocksProxyAgent(proxy);
-
+function checkProxy(proxy) {
     return new Promise((resolve) => {
-        const req = https.request("https://httpbin.org/ip", { agent }, (res) => {
-            console.log(`Response from ${proxy}: ${res.statusCode}`);
+        const isHttp = proxy.startsWith("http");
+        const agent = isHttp ? new HttpsProxyAgent(proxy) : new SocksProxyAgent(proxy);
 
-            let data = '';
-            res.on('data', chunk => {
-                data += chunk;
-            });
+        const req = https.request(TEST_URL, { agent, timeout: REQUEST_TIMEOUT }, (res) => {
+            let data = "";
 
-            res.on('end', () => {
+            res.on("data", chunk => (data += chunk));
+
+            res.on("end", () => {
                 if (res.statusCode === 200) {
                     try {
-                        const response = JSON.parse(data);
-                        console.log(`Proxy ${proxy} seems to be working. Your IP: ${response.origin}`);
-                        goodProxies.push(proxy);
-                    } catch (error) {
-                        console.error(`Failed to parse JSON from proxy ${proxy}: ${error.message}`);
+                        const json = JSON.parse(data);
+                        console.log(`Proxy ${proxy} works. IP: ${json.origin}`);
+                        resolve({ proxy, success: true });
+                    } catch {
+                        console.warn(`Invalid JSON response from proxy ${proxy}`);
+                        resolve({ proxy, success: false });
                     }
                 } else {
-                    console.error(`Proxy ${proxy} returned status code ${res.statusCode}. Response: ${data}`);
+                    console.warn(`Proxy ${proxy} returned status ${res.statusCode}`);
+                    resolve({ proxy, success: false });
                 }
-                req.destroy();
-                resolve();
             });
         });
 
-        req.on('error', (err) => {
-            console.error(`Proxy ${proxy} failed: ${err.message}`);
+        req.on("timeout", () => {
+            console.warn(`Proxy ${proxy} timed out.`);
             req.destroy();
-            resolve();
+            resolve({ proxy, success: false });
         });
 
-        setTimeout(() => {
-            console.error(`Proxy ${proxy} forcefully timed out.`);
-            req.destroy();
-            resolve();
-        }, 10000);
+        req.on("error", (err) => {
+            console.warn(`Proxy ${proxy} error: ${err.message}`);
+            resolve({ proxy, success: false });
+        });
 
-        req.end(); // End the request to send it
+        req.end();
     });
-};
+}
+
+// Limit concurrency so that this doesn't overload the system or server
+async function runWithConcurrency(tasks, limit) {
+    const results = [];
+    const executing = [];
+
+    for (const task of tasks) {
+        const p = task().then(result => {
+            executing.splice(executing.indexOf(p), 1); // Remove ourselves from `executing` when done
+            return result;
+        });
+        results.push(p);
+        executing.push(p);
+        if (executing.length >= limit) {
+            await Promise.race(executing);
+        }
+    }
+
+    return Promise.all(results);
+}
 
 (async () => {
-    const promises = proxies.map(proxy => checkProxy(proxy));
-    await Promise.all(promises);
+    try {
+        const proxies = loadProxies(PROXIES_FILE);
+        console.log(`Loaded ${proxies.length} proxies.`);
 
-    console.log("Writing to file...");
+        const tasks = proxies.map(proxy => () => checkProxy(proxy));
+        const concurrencyLimit = 20; // Adjust as needed
 
-    const storedProxies = fs.readFileSync("goodProxies.txt", "utf-8");
-    goodProxies = goodProxies.join('\n');
+        const results = await runWithConcurrency(tasks, concurrencyLimit);
+        const newGoodProxies = results.filter(r => r.success).map(r => r.proxy);
 
-    const allProxies = utilities.processProxies(goodProxies + '\n' + storedProxies).trim();
+        const storedProxies = loadProxies(GOOD_PROXIES_FILE);
 
-    fs.writeFileSync("goodProxies.txt", allProxies);
+        const allGoodProxies = storedProxies.concat(newGoodProxies);
+        const processed = util.processProxies(allGoodProxies.join("\n")).trim();
+
+        fs.writeFileSync(GOOD_PROXIES_FILE, processed);
+
+        console.log(`${newGoodProxies.length} new good proxies added. Total: ${allGoodProxies.length}`);
+    } catch (err) {
+        console.error("Fatal error:", err);
+        process.exit(1);
+    }
 })();
